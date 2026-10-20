@@ -1,8 +1,8 @@
 # whale 记忆桥（whale-memory-bridge）
 
 把 **DSH（DeepSeek Harness）** 上 **[dsh-bili-whale](https://github.com/Alterssss/dsh-bili-whale)** 插件
-每天写下的「看 B 站」日记，增量同步进 MaiBot 的 **A_Memorix 长期记忆**，
-并反向生成一份摘要供 whale 每轮醒来读取。
+每天写下的「看 B 站」日记，增量写入插件自己的**本地索引**，并提供只读检索工具；
+宿主支持长期记忆写入时，额外同步进 A_Memorix，同时生成一份摘要供 whale 每轮读取。
 
 一句话：**让麦麦记住「鲸鱼昨晚看了什么、想了什么」**，也让鲸鱼知道自己被记住了。
 
@@ -12,39 +12,33 @@
 
 | 角色 | 是什么 | 在本插件里的作用 |
 |---|---|---|
-| **DSH（DeepSeek Harness）** | DeepSeek 的 agent 运行时 | 提供 `~/.dsh/` 家目录，whale 的日记、事件流、游标都在这里 |
-| **dsh-bili-whale** | DSH 的「刷 B 站」插件：用一个小号登录、每晚挑视频深读打分，写成日记 | 产出 `whale-diary.md`（给主人的信 / 看过 / 想说但还没说）与 `whale-log.jsonl` |
-| **MaiBot + A_Memorix** | QQ 机器人与其长期记忆系统 | 接收本插件写入的记忆，供麦麦在聊天时检索 |
-
-> **没有 dsh-bili-whale 就没有数据源。** 本插件不刷 B 站、不联网，只读文件。
+| **DSH（DeepSeek Harness）** | DeepSeek 的 agent 运行时 | 提供 `~/.dsh/` 家目录，whale 的日记与事件流都在这里 |
+| **dsh-bili-whale** | DSH 的「刷 B 站」插件：每晚挑视频深读打分，写成日记 | 产出 `whale-diary.md` 与 `whale-log.jsonl` |
+| **MaiBot** | QQ 机器人 | 承载本插件与工具 |
+| **A_Memorix**（可选） | MaiBot 的长期记忆系统 | 宿主暴露 `knowledge.ingest` 时才写入 |
 
 ```
 dsh-bili-whale ──写──▶ ~/.dsh/whale-diary.md
                          │
-                         │ ① 正向同步（增量、幂等、带游标）
-                         ▼
-                    A_Memorix（指定聊天流作用域）
-                         │
-                         │ ② 反向摘要
-                         ▼
-              ~/.dsh/whale-memory.md ──读──▶ dsh-bili-whale 每轮醒来
+                         ├─▶ 本地索引（插件数据目录，始终可用）
+                         │        └─▶ whale_memory_search / context 工具
+                         ├─▶ A_Memorix（仅当宿主提供 knowledge.ingest）
+                         └─▶ ~/.dsh/whale-memory.md（只读摘要，供 whale 读取）
 ```
+
+> **没有 dsh-bili-whale 就没有数据源。** 本插件不刷 B 站、不联网，只读文件。
 
 ---
 
 ## 二、前置条件
 
-1. MaiBot ≥ 1.3.0，且 **A_Memorix 已启用**；
-2. A_Memorix 配置了 **embedding 模型**（未配置时只有关键词召回，写入会降级）；
-3. 有一个确定的「目标聊天流」`session_id`（记忆写进这个聊天流的检索作用域）；
-4. DSH 侧已安装 `dsh-bili-whale`，且 `~/.dsh/whale-diary.md` 已生成。
+1. MaiBot ≥ 1.3.0；
+2. DSH 侧已安装 `dsh-bili-whale`，且 `~/.dsh/whale-diary.md` 已生成；
+3. A_Memorix **可选**：只有宿主注册了 `knowledge.ingest` / `knowledge.search_hits`
+   时才会同步进长期记忆，否则自动降级为「本地索引 + 摘要」，工具照常可用。
 
-### 怎么拿目标 `session_id`
-
-在 MaiBot WebUI →「聊天流」里点开要接收记忆的私聊/群聊，详情里能看到 `session_id`；
-也可以查 `data/MaiBot.db` 的 `chat_sessions` 表。填进 `[target].target_session_id` 后重启 MaiBot。
-
-> 聊天流重建（换账号、清库）后 `session_id` 会变，需要重新填。
+> 原生 1.3.x 的插件能力注册表里只有 `knowledge.search`，没有写入能力。
+> 因此本插件**不声明**这两个能力；检测到缺失时只记一条日志并继续工作。
 
 ---
 
@@ -55,14 +49,13 @@ dsh-bili-whale ──写──▶ ~/.dsh/whale-diary.md
 ```bash
 cd MaiBot/plugins/whale-memory-bridge
 cp config.example.toml config.toml   # 仓库不提供含真实 session_id 的配置
-# 编辑 config.toml：填 [target].target_session_id
 ```
 
 在 WebUI「插件扩展」里启用（或重启 MaiBot）。日志出现这两行即在工作：
 
 ```
 whale 记忆桥已启动
-whale 外部记忆已更新: ~/.dsh/whale-memory.md（N 条）
+whale 外部记忆已更新: ~/.dsh/whale-memory.md（N 块）
 ```
 
 ---
@@ -72,22 +65,23 @@ whale 外部记忆已更新: ~/.dsh/whale-memory.md（N 条）
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `[source].whale_home` | `~/.dsh` | DSH 家目录 |
-| `[source].diary_file` | `whale-diary.md` | 公开日记（「看过」表在这里） |
-| `[source].private_diary_file` | `whale-diary-private.md` | 私密日记，默认不同步 |
-| `[source].include_private_diary` | `false` | 是否把私密日记也写进记忆，**公开环境请保持 false** |
-| `[target].target_session_id` | 空 | 记忆写入哪个聊天流；**空则不工作** |
-| `[target].source_type` | `chat_summary` | 必须是 `chat_summary`，否则检索不到 |
-| `[target].interval_seconds` | `300` | 后台增量扫描间隔 |
-| `[target].max_items_per_run` | `20` | 单轮最多写几条，控制成本 |
-| `[group].max_items` | `5` | 群聊被问「看过什么」时最多播报几条 |
-| `[digest].limit` | `12` | 反向摘要取多少条 |
+| `[source].diary_file` | `whale-diary.md` | 公开日记 |
+| `[source].private_diary_file` | `whale-diary-private.md` | 私密日记，默认不读 |
+| `[source].include_private_diary` | `false` | 是否连私密日记一起索引 |
+| `[source].cursor_file` | `whale-memory-bridge.cursor.json` | 游标文件名，**必须落在 `whale_home` 内** |
+| `[target].target_session_id` | 空 | A_Memorix 写入目标；留空则只写本地索引 |
+| `[target].source_type` | `chat_summary` | A_Memorix 的 source_type |
+| `[target].interval_seconds` | `300` | 后台扫描间隔 |
+| `[index].enabled` | `true` | 是否维护本地索引 |
+| `[index].max_entries` | `5000` | 索引保留上限，超出丢弃最旧 |
+| `[privacy].allow_private_tools` | `false` | 工具是否可返回私密章节（硬门禁） |
+| `[privacy].digest_include_private` | `false` | 摘要是否包含私密章节 |
+| `[digest].enabled` | `true` | 是否生成只读摘要 |
 
-### 两个必须踩对的点
+### 路径约束
 
-- **`source_type` 必须是 `chat_summary`**：A_Memorix 按 `source` 前缀解析检索作用域，
-  换成 `whale_seen` 会入库但聊天里查不到；
-- **清空 `data/a-memorix` 时必须同时删游标** `~/.dsh/whale-memory-bridge.cursor.json`，
-  或用 `whale_memory_sync force=true`。
+`cursor_file` 与 `digest.output_file` 会被 `resolve()` 后校验必须位于 `whale_home` 内，
+写 `../` 越界会直接报错。插件只写这两个文件，不修改 whale 的任何状态。
 
 ---
 
@@ -95,36 +89,42 @@ whale 外部记忆已更新: ~/.dsh/whale-memory.md（N 条）
 
 不注册聊天指令，全部由模型按需调用。
 
-| 工具 | 用途 | 可见范围 |
+| 工具 | 用途 | 私密内容 |
 |---|---|---|
-| `whale_seen_recent` | 最近看过的视频标题 + 一句想法；已剔除写给主人的信与私密内容 | 群聊可用 |
-| `whale_diary_recent` | 某天完整日记（信 / 心声 / 看过） | 私人，建议仅私聊 |
-| `whale_memory_search` | 在 A_Memorix 里检索 whale 记忆 | 由 `include_private` 控制 |
-| `whale_memory_context` | 把检索结果整理成可注入上下文的文本 | 同上 |
-| `whale_memory_read` | 读反向摘要 `whale-memory.md` | 私人 |
+| `whale_seen_recent` | 最近看过的视频 + 一句想法 | 否 |
+| `whale_diary_recent` | 某天日记（默认只给「看过」） | 受 `allow_private_tools` 控制 |
+| `whale_memory_search` | 检索索引 / 长期记忆 | 受 `allow_private_tools` 控制 |
+| `whale_memory_context` | 检索结果整理成可注入文本 | 同上 |
+| `whale_memory_read` | 读摘要文件 | 受 `digest_include_private` 控制 |
 | `whale_memory_sync` / `_digest` / `_status` | 手动同步 / 生成摘要 / 查看状态 | 管理用 |
 
-### 为什么群聊只给「看过」
+### 私密内容怎么界定
 
-日记原文是写给「主人」的私人叙事（例如「你别把没看当成我没在」）。直接搬进群会跑出
-人设，也会泄露只属于两个人的内容。所以群聊只播报「看过」，并清洗掉 `深读 / 只读字`
-这类内部标记与「主人」称呼；信和心声只走私聊工具。
+即使写在**公开**日记里，下面几类章节也按私密内容处理：
+
+```
+letter（给主人的信） / thoughts（想说但还没说） / preference / private_note
+```
+
+工具拿不到「当前是群聊还是私聊」，所以不做提示词层的劝退，而是用
+`[privacy].allow_private_tools` 做**硬开关**：默认关闭时，上述章节在检索、
+上下文、日记工具里一律不返回；`whale_seen_recent`（群聊播报用）永远不含它们。
 
 ---
 
-## 六、隐私与数据
+## 六、数据与隐私
 
-- **只读** DSH 的文件，不修改 whale 的任何状态；
-- 只写入你指定的聊天流，其他聊天流检索不到；
-- `include_private_diary = false` 时 `whale-diary-private.md` 完全不读；
-- 游标只记录已同步条目的 ID；
-- 仓库里的默认配置**不含任何个人 session_id 或路径**，需要你自己填。
+- **只读** whale 的源文件，不修改 whale 的任何状态；
+- 本地索引写在插件数据目录（`config.index.file`），不进入 MaiBot 聊天库；
+- 写入 `whale_home` 的只有游标与摘要两个文件，且路径被限制在 `whale_home` 内；
+- 私密章节默认不索引、不写摘要、工具不返回；
+- 仓库里的默认配置不含任何个人 session_id 或绝对路径。
 
 ---
 
 ## 七、已知限制
 
-- A_Memorix 必须配 embedding，否则只有 FTS，写入降级；
+- 原生 1.3.x 没有 `knowledge.ingest`，因此 A_Memorix 同步会自动跳过，只保留本地索引；
 - 日记随日期增长，`whale_memory_digest` 的 prompt 会变长，注意成本；
 - 依赖 DSH 与 dsh-bili-whale 的文件格式，上游改格式需同步改 `whale_source.py`；
-- 反向摘要每轮被 whale 读取，属于「只读注入」，不会回写 whale 的状态。
+- 索引是 JSONL 明文，位于插件数据目录，注意备份与访问权限。

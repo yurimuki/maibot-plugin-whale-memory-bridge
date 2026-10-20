@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "version": "0.4.3",
+  "version": "0.5.0",
   "name": "whale 记忆桥",
-  "description": "把 DSH 的 dsh-bili-whale 日记增量写入 MaiBot A_Memorix，并提供「最近看过」等只读工具；配合 DeepSeek Harness 使用。",
+  "description": "把 DSH（DeepSeek Harness）上 dsh-bili-whale 的日记增量写入本地索引，提供只读检索工具与摘要；私密章节默认硬关闭。",
   "author": {
     "name": "yurimuki",
     "url": "https://github.com/yurimuki"
@@ -30,15 +30,13 @@
       "fallback": "database"
     }
   },
-  "capabilities": [
-    "knowledge.ingest",
-    "knowledge.search_hits"
-  ],
+  "capabilities": [],
   "i18n": {
     "default_locale": "zh-CN",
     "supported_locales": [
       "zh-CN"
     ]
   },
-  "id": "local.whale-memory-bridge"
+  "id": "local.whale-memory-bridge",
+  "plugin_type": "data"
 }

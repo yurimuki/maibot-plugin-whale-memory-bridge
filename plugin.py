@@ -1,14 +1,15 @@
-"""whale → A_Memorix 记忆桥。
+"""whale 日记桥。
 
-把 whale 日记「看过」表格与可选的事件流增量写入 A_Memorix，作用域固定为配置里
-的私聊聊天流（默认雪糕私聊），因此群聊检索不到这些记忆。
+把 DSH（DeepSeek Harness）上 dsh-bili-whale 写下的日记，增量写入插件自己的
+本地索引，并生成一份只读摘要供 whale 每轮读取；在宿主提供长期记忆写入能力时，
+额外把条目同步进 A_Memorix。
 
 设计要点：
-- **只读 whale 的文件**，不修改 whale 的任何状态；
+- **只读 whale 的源文件**；只在 `whale_home` 下写游标与摘要两个文件；
 - **幂等**：每条记忆用稳定的 external_id，重复运行不会重复入库；
-- **游标**：已同步的 ID 记在本地 JSON，避免每次全量调用；
-- **不阻塞事件循环**：文件读写走 asyncio.to_thread；
-- **无 embedding 也能跑**：A_Memorix 会以 sparse/metadata-only 模式落库。
+- **游标**：已同步的 ID 记在本地 JSON，避免每次全量处理；
+- **可降级**：宿主没有 `knowledge.ingest` 时，索引与工具照常工作，
+  只有 A_Memorix 同步被跳过。
 """
 
 from __future__ import annotations
@@ -41,7 +42,7 @@ class BridgePluginConfig(PluginConfigBase):
     __ui_label__ = "插件"
 
     enabled: bool = Field(default=True, description="是否启用 whale 记忆桥")
-    config_version: str = Field(default="1.1.0", description="配置版本")
+    config_version: str = Field(default="1.3.0", description="配置版本")
 
 
 class BridgeSourceConfig(PluginConfigBase):
@@ -52,7 +53,9 @@ class BridgeSourceConfig(PluginConfigBase):
     whale_home: str = Field(default="~/.dsh", description="whale 的 DSH 家目录")
     diary_file: str = Field(default="whale-diary.md", description="叙事日记文件名")
     private_diary_file: str = Field(default="whale-diary-private.md", description="私密日记文件名")
-    include_private_diary: bool = Field(default=True, description="是否把私密日记也写入长期记忆")
+    include_private_diary: bool = Field(
+        default=False, description="是否把私密日记也写入索引与长期记忆"
+    )
     log_file: str = Field(default="whale-log.jsonl", description="事件流文件名")
     cursor_file: str = Field(default="whale-memory-bridge.cursor.json", description="同步游标文件名")
     log_event_kinds: str = Field(default="", description="要从事件流同步的 kind，逗号分隔；留空表示只同步日记")
@@ -71,6 +74,32 @@ class BridgeTargetConfig(PluginConfigBase):
     interval_seconds: int = Field(default=300, description="后台同步间隔（秒）")
     max_items_per_run: int = Field(default=20, description="每轮最多写入多少条")
     dry_run: bool = Field(default=False, description="只解析与记录，不真正写入 A_Memorix")
+
+
+class BridgeIndexConfig(PluginConfigBase):
+    """本地索引：不依赖宿主长期记忆能力也能检索。"""
+
+    __ui_label__ = "本地索引"
+    __ui_order__ = 4
+
+    enabled: bool = Field(default=True, description="是否维护本地索引文件")
+    file: str = Field(default="whale-index.jsonl", description="索引文件名（落在插件数据目录）")
+    max_entries: int = Field(default=5000, description="索引最多保留多少条，超出丢弃最旧的")
+
+
+class BridgePrivacyConfig(PluginConfigBase):
+    """私密内容的硬门禁。"""
+
+    __ui_label__ = "隐私"
+    __ui_order__ = 6
+
+    allow_private_tools: bool = Field(
+        default=False,
+        description="是否允许工具返回私密内容（给主人的信/心声）。工具拿不到聊天流类型，默认关闭即硬门禁",
+    )
+    digest_include_private: bool = Field(
+        default=False, description="反向摘要是否包含私密章节"
+    )
 
 
 class BridgeGroupConfig(PluginConfigBase):
@@ -101,6 +130,8 @@ class WhaleMemoryBridgeConfig(PluginConfigBase):
     source: BridgeSourceConfig = Field(default_factory=BridgeSourceConfig)
     target: BridgeTargetConfig = Field(default_factory=BridgeTargetConfig)
     group: BridgeGroupConfig = Field(default_factory=BridgeGroupConfig)
+    index: BridgeIndexConfig = Field(default_factory=BridgeIndexConfig)
+    privacy: BridgePrivacyConfig = Field(default_factory=BridgePrivacyConfig)
     digest: BridgeDigestConfig = Field(default_factory=BridgeDigestConfig)
 
 
@@ -108,6 +139,9 @@ class WhaleMemoryBridgePlugin(MaiBotPlugin):
     """把 whale 的记忆增量同步进 A_Memorix。"""
 
     config_model = WhaleMemoryBridgeConfig
+
+    # 这些章节即使写在公开日记里，也按私密内容处理
+    _PRIVATE_SECTIONS = {"letter", "thoughts", "preference", "private_note"}
 
     def __init__(self) -> None:
         """初始化后台任务状态。"""
@@ -118,6 +152,8 @@ class WhaleMemoryBridgePlugin(MaiBotPlugin):
         self._last_run_at: str = ""
         self._last_error: str = ""
         self._last_summary: Dict[str, Any] = {}
+        self._ingest_ok: Optional[bool] = None
+        self._hits_ok: Optional[bool] = None
         self._last_digest: Dict[str, Any] = {}
 
     async def on_load(self) -> None:
@@ -199,8 +235,142 @@ class WhaleMemoryBridgePlugin(MaiBotPlugin):
         home = self._home()
         diary = home / self.config.source.diary_file
         event_log = home / self.config.source.log_file
-        cursor = home / self.config.source.cursor_file
+        cursor = self._safe_under(home, self.config.source.cursor_file)
         return diary, event_log, cursor
+
+    @staticmethod
+    def _safe_under(base: Path, name: str) -> Path:
+        """把配置里的相对文件名限制在 base 目录内，防止 ../ 越界。"""
+
+        candidate = (base / str(name or "")).resolve()
+        root = base.resolve()
+        if candidate != root and root not in candidate.parents:
+            raise ValueError(f"路径越界：{name!r} 不在 {root} 内")
+        return candidate
+
+    def _index_path(self) -> Path:
+        """本地索引文件路径（插件数据目录内）。"""
+
+        return self._safe_under(self.ctx.paths.data_dir, self.config.index.file or "whale-index.jsonl")
+
+    async def _index_load(self) -> List[Dict[str, Any]]:
+        """读取本地索引。"""
+
+        path = self._index_path()
+        if not path.exists():
+            return []
+
+        def _read() -> List[Dict[str, Any]]:
+            entries: List[Dict[str, Any]] = []
+            try:
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(data, dict):
+                        entries.append(data)
+            except OSError as exc:
+                self.ctx.logger.warning(f"读取本地索引失败: {exc}")
+            return entries
+
+        return await asyncio.to_thread(_read)
+
+    async def _index_append(self, items: List[WhaleMemoryItem]) -> int:
+        """把条目追加进本地索引（按 external_id 去重）。"""
+
+        if not self.config.index.enabled or not items:
+            return 0
+        path = self._index_path()
+        known = {str(entry.get("external_id") or "") for entry in await self._index_load()}
+        fresh = [item for item in items if item.external_id not in known]
+        if not fresh:
+            return 0
+        limit = max(100, int(self.config.index.max_entries))
+
+        def _write() -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                for item in fresh:
+                    handle.write(
+                        json.dumps(
+                            {
+                                "external_id": item.external_id,
+                                "observed_at": item.observed_at,
+                                "section": item.section,
+                                "entry_label": item.entry_label,
+                                "bv": item.bv,
+                                "title": item.title,
+                                "thought": item.thought,
+                                "text": item.render_text(),
+                                "visibility": item.visibility,
+                                "sensitive": item.section in self._PRIVATE_SECTIONS
+                                or item.visibility == "private",
+                                "score": item.score,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+            kept = path.read_text(encoding="utf-8").splitlines()[-limit:]
+            path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+
+        await asyncio.to_thread(_write)
+        return len(fresh)
+
+    async def _search_index(
+        self, query: str, limit: int, section: str = "", date: str = "", include_private: bool = False
+    ) -> List[Dict[str, Any]]:
+        """在本地索引里做关键词检索。"""
+
+        entries = await self._index_load()
+        needle = (query or "").strip().lower()
+        wanted_section = (section or "").strip()
+        results: List[Dict[str, Any]] = []
+        for entry in reversed(entries):
+            sensitive = bool(entry.get("sensitive")) or str(entry.get("visibility") or "") == "private"
+            if not include_private and sensitive:
+                continue
+            if wanted_section:
+                raw_section = str(entry.get("section") or "")
+                label = SECTION_LABELS.get(raw_section, raw_section)
+                if wanted_section not in (raw_section, label):
+                    continue
+            if date and not str(entry.get("observed_at") or "").startswith(date):
+                continue
+            text = str(entry.get("text") or "")
+            if needle and needle not in text.lower():
+                continue
+            results.append(
+                {
+                    "content": text,
+                    "score": entry.get("score"),
+                    "source": "index",
+                    "hash": None,
+                    "title": entry.get("title"),
+                    "metadata": {
+                        "bridge": "whale-memory-bridge",
+                        "section": entry.get("section"),
+                        "entry_label": entry.get("entry_label"),
+                        "bv": entry.get("bv"),
+                        "title": entry.get("title"),
+                        "visibility": entry.get("visibility"),
+                        "observed_at": entry.get("observed_at"),
+                        "score": entry.get("score"),
+                    },
+                }
+            )
+            if len(results) >= limit:
+                break
+        return results
+
+    def _private_allowed(self) -> bool:
+        """私密内容是否被配置放行。"""
+
+        return bool(self.config.privacy.allow_private_tools)
 
     def _private_diary_path(self) -> Path:
         """私密日记路径。"""
@@ -238,6 +408,10 @@ class WhaleMemoryBridgePlugin(MaiBotPlugin):
         cursor = SyncCursor(cursor_path)
         await asyncio.to_thread(cursor.load)
 
+        # 索引为空（首次启用/重建）时忽略游标做一次全量，否则历史条目永远进不了索引
+        if self.config.index.enabled and not await self._index_load():
+            force = True
+
         items = await self._collect_items()
         pending = items if force else [item for item in items if not cursor.contains(item.external_id)]
         limit = max(1, int(self.config.target.max_items_per_run))
@@ -253,22 +427,48 @@ class WhaleMemoryBridgePlugin(MaiBotPlugin):
             "dry_run": bool(self.config.target.dry_run),
         }
         written_ids: List[str] = []
+        indexed = 0
+        memory_skipped = False
+        if not self.config.target.dry_run:
+            indexed = await self._index_append(batch)
+
         for item in batch:
             if self.config.target.dry_run:
                 self.ctx.logger.info(f"[dry-run] {item.external_id} :: {item.render_text()[:80]}")
+                written_ids.append(item.external_id)
+                continue
+            # 本地索引已覆盖该条；长期记忆不可用时只跳过一次写入
+            if not self.config.target.target_session_id or self._ingest_ok is False:
+                memory_skipped = True
                 written_ids.append(item.external_id)
                 continue
             try:
                 payload = self._build_payload(item)
                 reply = await self.ctx.call_capability("knowledge.ingest", **payload)
             except Exception as exc:  # noqa: BLE001 - 单条失败不应中断整批
+                if self._ingest_ok is not False and _capability_missing(exc):
+                    self._ingest_ok = False
+                    memory_skipped = True
+                    self.ctx.logger.info(
+                        "宿主未提供 knowledge.ingest，后续只写本地索引（工具仍可用）"
+                    )
+                    written_ids.append(item.external_id)
+                    continue
                 result["failed"] += 1
                 self._last_error = f"{item.external_id}: {type(exc).__name__}: {exc}"
                 self.ctx.logger.warning(f"whale 记忆写入失败: {item.external_id}: {exc}")
                 continue
             if not isinstance(reply, dict) or reply.get("success") is False:
-                result["failed"] += 1
                 detail = reply.get("error") if isinstance(reply, dict) else reply
+                if self._ingest_ok is not False and _capability_missing(detail):
+                    self._ingest_ok = False
+                    memory_skipped = True
+                    self.ctx.logger.info(
+                        "宿主未提供 knowledge.ingest，后续只写本地索引（工具仍可用）"
+                    )
+                    written_ids.append(item.external_id)
+                    continue
+                result["failed"] += 1
                 self._last_error = f"{item.external_id}: {detail}"
                 self.ctx.logger.warning(f"whale 记忆写入被拒绝: {item.external_id}: {detail}")
                 continue
@@ -280,6 +480,8 @@ class WhaleMemoryBridgePlugin(MaiBotPlugin):
                 result["skipped_exists"] += 1
             written_ids.append(item.external_id)
 
+        result["indexed"] = indexed
+        result["memory_skipped"] = memory_skipped
         cursor.mark(written_ids)
         await asyncio.to_thread(cursor.save)
 
@@ -289,7 +491,8 @@ class WhaleMemoryBridgePlugin(MaiBotPlugin):
         if result["written"] or result["queued"] or result["skipped_exists"] or result["failed"]:
             self.ctx.logger.info(
                 "whale 记忆同步: "
-                f"扫描 {result['scanned']} / 待写 {result['pending']} / 新写 {result['written']} / "
+                f"扫描 {result['scanned']} / 待写 {result['pending']} / 索引新增 {result.get('indexed', 0)} / "
+                f"新写 {result['written']} / "
                 f"已存在 {result['skipped_exists']} / 排队 {result['queued']} / 失败 {result['failed']}"
             )
         return result
@@ -305,6 +508,12 @@ class WhaleMemoryBridgePlugin(MaiBotPlugin):
         limit = max(1, int(self.config.digest.limit))
         cutoff = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
         all_items = await self._collect_items()
+        if not self.config.privacy.digest_include_private:
+            all_items = [
+                item
+                for item in all_items
+                if item.visibility != "private" and item.section not in self._PRIVATE_SECTIONS
+            ]
         items = [item for item in all_items if (item.observed_at or "") >= cutoff]
         if not items:
             items = all_items[-limit:]
@@ -362,7 +571,7 @@ class WhaleMemoryBridgePlugin(MaiBotPlugin):
         if truncated:
             text = text[:max_chars].rstrip() + "\n\n（已截断）\n"
 
-        output_path = self._home() / self.config.digest.output_file
+        output_path = self._safe_under(self._home(), self.config.digest.output_file)
         changed = await asyncio.to_thread(_write_atomic, output_path, text)
         self._last_digest = {
             "path": str(output_path),
@@ -444,6 +653,7 @@ class WhaleMemoryBridgePlugin(MaiBotPlugin):
                 synced = len(payload.get("synced") or {})
             except (OSError, json.JSONDecodeError):
                 synced = 0
+        index_entries = len(await self._index_load()) if self.config.index.enabled else 0
         return {
             "success": True,
             "last_run_at": self._last_run_at,
@@ -451,13 +661,20 @@ class WhaleMemoryBridgePlugin(MaiBotPlugin):
             "last_digest": self._last_digest,
             "last_error": self._last_error,
             "synced_ids": synced,
-            "target_session_id": self.config.target.target_session_id,
+            "index_entries": index_entries,
+            "index_enabled": bool(self.config.index.enabled),
+            "long_term_memory": {
+                "target_session_id": self.config.target.target_session_id,
+                "ingest_available": self._ingest_ok is not False,
+                "search_hits_available": self._hits_ok is not False,
+            },
+            "private_tools_allowed": self._private_allowed(),
         }
 
 
     @Tool(
         "whale_memory_read",
-        description="读取 whale 外部记忆摘要文件（whale-memory.md），绕过 MCP filesystem 的目录限制",
+        description="直接返回 whale 外部记忆摘要（whale-memory.md）的内容，省得 agent 再走文件工具",
         parameters=[
             ToolParameterInfo(
                 name="max_chars",
@@ -468,10 +685,10 @@ class WhaleMemoryBridgePlugin(MaiBotPlugin):
         ],
     )
     async def handle_read(self, max_chars: int = 0, **kwargs: Any) -> Dict[str, Any]:
-        """直接读取摘要文件，避免 agent 用文件工具访问 ~/.dsh 时被拒。"""
+        """返回摘要文件内容。"""
 
         _ = kwargs
-        path = self._home() / self.config.digest.output_file
+        path = self._safe_under(self._home(), self.config.digest.output_file)
         if not path.exists():
             return {"success": False, "path": str(path), "error": "摘要文件不存在"}
         try:
@@ -531,24 +748,38 @@ class WhaleMemoryBridgePlugin(MaiBotPlugin):
         date: str = "",
         include_private: bool = False,
     ) -> List[Dict[str, Any]]:
-        """检索 whale 日记记忆，并按章节/日期/隐私过滤。"""
+        """检索 whale 记忆：本地索引优先，长期记忆可用时再补充。"""
+
+        clean_limit = max(1, min(20, int(limit or 5)))
+        # 工具拿不到聊天流类型，私密内容只能靠配置做硬门禁
+        include_private = include_private and self._private_allowed()
+        results = await self._search_index(query, clean_limit, section, date, include_private)
 
         target = str(self.config.target.target_session_id or "").strip()
-        if not target:
-            raise ValueError("target.target_session_id 未配置")
-        clean_limit = max(1, min(20, int(limit or 5)))
+        if len(results) >= clean_limit or not target or self._hits_ok is False:
+            return results
+
         query_text = (query or "").strip() or "whale 日记"
-        reply = await self.ctx.call_capability(
-            "knowledge.search_hits",
-            query=query_text,
-            chat_id=target,
-            limit=max(clean_limit * 4, 20),
-            mode="search",
-            respect_filter=False,
-        )
-        if not isinstance(reply, dict):
-            return []
-        raw_hits = [item for item in (reply.get("hits") or []) if isinstance(item, dict)]
+        try:
+            reply = await self.ctx.call_capability(
+                "knowledge.search_hits",
+                query=query_text,
+                chat_id=target,
+                limit=max(clean_limit * 4, 20),
+                mode="search",
+                respect_filter=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - 能力不可用时回退到本地索引
+            if _capability_missing(exc):
+                self._hits_ok = False
+                self.ctx.logger.info("宿主未提供 knowledge.search_hits，检索只用本地索引")
+            return results
+        if not isinstance(reply, dict) or reply.get("success") is False:
+            detail = reply.get("error") if isinstance(reply, dict) else reply
+            if _capability_missing(detail):
+                self._hits_ok = False
+                self.ctx.logger.info("宿主未提供 knowledge.search_hits，检索只用本地索引")
+            return results
 
         section_text = (section or "").strip()
         wanted_sections = {section_text} if section_text else set()
@@ -559,8 +790,8 @@ class WhaleMemoryBridgePlugin(MaiBotPlugin):
             if label:
                 wanted_sections.add(label)
 
-        results: List[Dict[str, Any]] = []
-        for hit in raw_hits:
+        seen = {str(item.get("hash") or item.get("content") or "") for item in results}
+        for hit in [item for item in (reply.get("hits") or []) if isinstance(item, dict)]:
             if not self._is_whale_hit(hit):
                 continue
             meta = self._hit_metadata(hit)
@@ -568,8 +799,15 @@ class WhaleMemoryBridgePlugin(MaiBotPlugin):
                 continue
             if date and not str(meta.get("observed_at") or "").startswith(date):
                 continue
-            if not include_private and str(meta.get("visibility") or "") == "private":
+            if not include_private and (
+                str(meta.get("visibility") or "") == "private"
+                or str(meta.get("section") or "") in self._PRIVATE_SECTIONS
+            ):
                 continue
+            signature = str(hit.get("hash") or hit.get("content") or "")
+            if signature in seen:
+                continue
+            seen.add(signature)
             results.append(
                 {
                     "content": str(hit.get("content") or ""),
@@ -592,7 +830,7 @@ class WhaleMemoryBridgePlugin(MaiBotPlugin):
             ToolParameterInfo(name="limit", param_type=ToolParamType.INTEGER, description="返回条数，默认 5", required=False),
             ToolParameterInfo(name="section", param_type=ToolParamType.STRING, description="章节过滤：letter/seen/thoughts/preference/private_note", required=False),
             ToolParameterInfo(name="date", param_type=ToolParamType.STRING, description="日期过滤，YYYY-MM-DD", required=False),
-            ToolParameterInfo(name="include_private", param_type=ToolParamType.BOOLEAN, description="是否包含私密日记，默认 false（群聊不要开）", required=False),
+            ToolParameterInfo(name="include_private", param_type=ToolParamType.BOOLEAN, description="是否包含私密日记；只有 privacy.allow_private_tools 打开时才生效", required=False),
         ],
     )
     async def handle_search(
@@ -619,7 +857,7 @@ class WhaleMemoryBridgePlugin(MaiBotPlugin):
             ToolParameterInfo(name="section", param_type=ToolParamType.STRING, description="章节过滤", required=False),
             ToolParameterInfo(name="date", param_type=ToolParamType.STRING, description="日期过滤，YYYY-MM-DD", required=False),
             ToolParameterInfo(name="max_chars", param_type=ToolParamType.INTEGER, description="上下文最大字符数，默认 2000", required=False),
-            ToolParameterInfo(name="include_private", param_type=ToolParamType.BOOLEAN, description="是否包含私密日记，默认 false（群聊不要开）", required=False),
+            ToolParameterInfo(name="include_private", param_type=ToolParamType.BOOLEAN, description="是否包含私密日记；只有 privacy.allow_private_tools 打开时才生效", required=False),
         ],
     )
     async def handle_context(
@@ -761,8 +999,10 @@ class WhaleMemoryBridgePlugin(MaiBotPlugin):
             return {"success": False, "error": "还没有日记"}
         day = (date or "").strip() or max(item.observed_at for item in items)
         picked = [item for item in items if item.observed_at == day]
+        if not self._private_allowed():
+            picked = [item for item in picked if item.section not in {"letter", "thoughts", "preference", "private_note"}]
         if not picked:
-            return {"success": False, "error": f"{day} 没有日记"}
+            return {"success": False, "error": f"{day} 没有可公开的日记（私密章节已在 privacy 配置里关闭）"}
         payload = [
             {
                 "section": SECTION_LABELS.get(item.section, item.section),
@@ -810,6 +1050,23 @@ def _parse_timestamp(observed_at: str) -> Optional[float]:
         return datetime.strptime(observed_at, "%Y-%m-%d").timestamp()
     except ValueError:
         return None
+
+
+def _capability_missing(detail: Any) -> bool:
+    """判断宿主是否缺少某个能力（未注册或未授权）。"""
+
+    text = str(detail or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "未注册的能力",
+            "未授权",
+            "未获授权",
+            "not registered",
+            "unauthorized",
+            "permission denied",
+        )
+    )
 
 
 def create_plugin() -> WhaleMemoryBridgePlugin:
