@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "0.5.1",
+  "version": "0.5.2",
   "name": "whale 记忆桥",
   "description": "把 DSH（DeepSeek Harness）上 dsh-bili-whale 的日记增量写入本地索引，提供只读检索工具与摘要；私密章节默认硬关闭。",
   "author": {

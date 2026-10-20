@@ -1060,8 +1060,10 @@ def _capability_missing(detail: Any) -> bool:
         marker in text
         for marker in (
             "未注册的能力",
+            "未注册能力令牌",
             "未授权",
             "未获授权",
+            "capability_denied",
             "not registered",
             "unauthorized",
             "permission denied",
