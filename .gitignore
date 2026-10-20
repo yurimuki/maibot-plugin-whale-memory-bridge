@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+# 真实配置不入库（含本地 session_id），仓库只提供 config.example.toml
+config.toml

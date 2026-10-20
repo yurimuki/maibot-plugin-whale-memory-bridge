@@ -1,0 +1,29 @@
+[plugin]
+enabled = true
+config_version = "1.2.0"
+
+[source]
+whale_home = "~/.dsh"
+diary_file = "whale-diary.md"
+private_diary_file = "whale-diary-private.md"
+include_private_diary = false
+log_file = "whale-log.jsonl"
+cursor_file = "whale-memory-bridge.cursor.json"
+log_event_kinds = ""
+
+[target]
+target_session_id = ""
+source_type = "chat_summary"
+interval_seconds = 300
+max_items_per_run = 20
+dry_run = false
+
+[group]
+max_items = 5
+
+[digest]
+enabled = true
+output_file = "whale-memory.md"
+lookback_days = 7
+limit = 12
+max_chars = 4000
